@@ -519,7 +519,13 @@ function decodeNumericCharacterReferences(text) {
 
 function cleanUrl(href) {
   try {
-    href = encodeURI(href).replace(misc.percentDecode, '%');
+    // encodeURI only produces %25 from a literal % in the input, so without
+    // one the percent-decode pass has nothing to do.
+    const hasPercent = href.includes('%');
+    href = encodeURI(href);
+    if (hasPercent) {
+      href = href.replace(misc.percentDecode, '%');
+    }
   } catch {
     return null;
   }
@@ -527,9 +533,12 @@ function cleanUrl(href) {
 }
 
 function splitCells(tableRow, count) {
-  // Ensure that every cell-delimiting pipe has a space before it to
-  // distinguish it from an escaped pipe.
-  const row = tableRow.replace(misc.findPipe, (match, offset, str) => {
+  const hasBackslash = tableRow.includes('\\');
+  let cells;
+  if (hasBackslash) {
+    // Ensure that every cell-delimiting pipe has a space before it to
+    // distinguish it from an escaped pipe.
+    const row = tableRow.replace(misc.findPipe, (match, offset, str) => {
       let escaped = false;
       let curr = offset;
       while (--curr >= 0 && str[curr] === '\\') escaped = !escaped;
@@ -539,8 +548,13 @@ function splitCells(tableRow, count) {
       }
       // Add space before unescaped |.
       return ' |';
-    }),
+    });
     cells = row.split(misc.splitPipe);
+  } else {
+    // Without a backslash no pipe is escaped, so a plain split on '|'
+    // gives the same cells the replace-and-split dance would.
+    cells = tableRow.split('|');
+  }
   let i = 0;
 
   // First/last cell in a row cannot be empty if it has no leading/trailing pipe.
@@ -561,7 +575,10 @@ function splitCells(tableRow, count) {
 
   for (; i < cells.length; i++) {
     // Leading or trailing whitespace is ignored per the GFM spec.
-    cells[i] = cells[i].trim().replace(misc.slashPipe, '|');
+    cells[i] = cells[i].trim();
+    if (hasBackslash) {
+      cells[i] = cells[i].replace(misc.slashPipe, '|');
+    }
   }
   return cells;
 }
@@ -612,7 +629,14 @@ function trimTrailingBlankLines(str) {
 // through upper case does, as in commonmark.js; the final `toLowerCase()`
 // keeps the folded label lower case.
 function normalizeLabel(label) {
-  return label.trim().replace(misc.multipleSpaceGlobal, ' ').toLowerCase().toUpperCase().toLowerCase();
+  const folded = label.trim().replace(misc.multipleSpaceGlobal, ' ');
+  // ASCII fast path: every ASCII character round-trips through upper case,
+  // so lower-upper-lower is just lower case. Non-ASCII keeps the full fold
+  // (e.g. 'ß' folds to 'ss' only via upper case).
+  if (/^[\x00-\x7F]*$/.test(folded)) {
+    return folded.toLowerCase();
+  }
+  return folded.toLowerCase().toUpperCase().toLowerCase();
 }
 
 function findClosingBracket(str, b) {
@@ -650,30 +674,72 @@ function findClosingBracket(str, b) {
 const closerHintStacks = new WeakMap();
 
 function scanLastPossibleClosers(src) {
-  const lastEmStrong = { '*': -1, _: -1 };
-  let lastDel = -1;
-  const len = src.length;
-  for (let i = 0; i < len; i++) {
-    const ch = src[i];
-    if (ch !== '*' && ch !== '_' && ch !== '~') {
-      continue;
-    }
-    // A leading run has no predecessor, same as one after a line break.
-    const prev = i === 0 ? '\n' : src[i - 1];
-    let j = i + 1;
-    while (j < len && src[j] === ch) {
-      j++;
-    }
-    if (prev !== ' ' && prev !== '\t' && prev !== '\n' && prev !== '\r' && prev !== '\f') {
-      if (ch === '~') {
-        lastDel = i;
-      } else {
-        lastEmStrong[ch] = i;
+  return {
+    maskedSrc: src,
+    lastEmStrong: { '*': lastClosableRun(src, '*'), '_': lastClosableRun(src, '_') },
+    lastDel: lastClosableRun(src, '~'),
+  };
+}
+
+// The start of the last run of `ch` that can close: not preceded by ASCII
+// whitespace, and not at the start of the string (a leading run has no
+// predecessor, same as one after a line break). Scanned backwards with
+// lastIndexOf — the last run is usually near the end, so this avoids the
+// full forward walk.
+function lastClosableRun(src, ch) {
+  let limit = src.length - 1;
+  while (limit >= 0) {
+    const p = src.lastIndexOf(ch, limit);
+    if (p === -1) return -1;
+    let start = p;
+    while (start > 0 && src[start - 1] === ch) start--;
+    if (start > 0) {
+      const prev = src[start - 1];
+      if (prev !== ' ' && prev !== '\t' && prev !== '\n' && prev !== '\r' && prev !== '\f') {
+        return start;
       }
     }
-    i = j - 1;
+    limit = start - 1;
   }
-  return { maskedSrc: src, lastEmStrong, lastDel };
+  return -1;
+}
+
+// Exactly what inlineRules.punctuation.exec(ch) tests — the first code point
+// is whitespace or punctuation/symbol, except * and _ — with an ASCII fast
+// path so the unicode-property regex only runs for non-ASCII input.
+function isPunctOrSpace(ch) {
+  if (ch.length === 1) {
+    const c = ch.charCodeAt(0);
+    if (c < 128) {
+      if (c === 42 || c === 95) return false; // * _ excluded by the lookahead
+      return (c >= 9 && c <= 13) || c === 32
+        || (c >= 33 && c <= 47) || (c >= 58 && c <= 64)
+        || (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
+    }
+  } else if (ch.length === 0) {
+    return false;
+  }
+  return !!inlineRules.punctuation.exec(ch);
+}
+
+// Exactly what misc.unicodeAlphaNumeric.test(ch) tests — the first code point
+// is a letter or a number — with an ASCII fast path.
+function isAlphaNumericChar(ch) {
+  if (ch.length === 1) {
+    const c = ch.charCodeAt(0);
+    if (c < 128) return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+  } else if (ch.length === 0) {
+    return false;
+  }
+  return misc.unicodeAlphaNumeric.test(ch);
+}
+
+// Exactly what String.prototype.trim tests for a single code point: the
+// White_Space set plus line terminators. An astral code point is never one.
+function isWhitespaceCode(c) {
+  return c === 32 || (c >= 9 && c <= 13) || c === 0x00a0 || c === 0x1680
+    || (c >= 0x2000 && c <= 0x200a) || c === 0x2028 || c === 0x2029
+    || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff;
 }
 
 function beginCloserScan(tokenizer, maskedSrc) {
@@ -1002,13 +1068,17 @@ class Tokenizer {
         lines = lines.slice(i);
 
         const currentRaw = currentLines.join('\n');
-        const currentText = currentRaw
-          // A tab after the block quote marker runs to the next tab stop, and
-          // the marker only consumes one space of it; the rest is content.
-          .replace(
+        // A tab after the block quote marker runs to the next tab stop, and
+        // the marker only consumes one space of it; the rest is content.
+        // Without a tab anywhere the expansion is the identity, so skip it.
+        let currentText = currentRaw;
+        if (currentRaw.includes('\t')) {
+          currentText = currentText.replace(
             misc.blockquoteMarkerWhitespace,
             (_, marker, whitespace) => marker + expandTabs(whitespace, marker.length),
-          )
+          );
+        }
+        currentText = currentText
           // Precede setext continuation with 4 spaces so it isn't a setext.
           .replace(misc.blockquoteSetextReplace, '\n    $1')
           .replace(misc.blockquoteSetextReplace2, '');
@@ -1720,14 +1790,14 @@ class Tokenizer {
         && runPrevSlice.charCodeAt(1) >= 0xdc00 && runPrevSlice.charCodeAt(1) <= 0xdfff
         ? runPrevSlice : runPrevSlice.slice(-1));
     // The other delimiter character counts as punctuation here (`_**a*`).
-    const runPrevPunct = runPrevChar === '*' || runPrevChar === '_' || !!inlineRules.punctuation.exec(runPrevChar);
+    const runPrevPunct = runPrevChar === '*' || runPrevChar === '_' || isPunctOrSpace(runPrevChar);
     if (runStart < srcStart) {
       prevChar = runPrevChar;
     }
-    const prevPunct = runStart < srcStart ? runPrevPunct : !!inlineRules.punctuation.exec(prevChar);
+    const prevPunct = runStart < srcStart ? runPrevPunct : isPunctOrSpace(prevChar);
 
     // _ can't be between two alphanumerics. \p{L}\p{N} includes non-english alphabet/numbers as well.
-    if (match[4] && misc.unicodeAlphaNumeric.test(prevChar)) return;
+    if (match[4] && isAlphaNumericChar(prevChar)) return;
 
     const nextChar = match[1] || match[3] || '';
 
@@ -1742,7 +1812,7 @@ class Tokenizer {
       // Rules 9-10 count the whole run, and also apply when the opener could
       // close as well (`a*b**`, where `*` is both left- and right-flanking).
       const runLength = srcStart - runStart + lLength;
-      const openerCanClose = !!runPrevChar.trim()
+      const openerCanClose = runPrevChar !== '' && (runPrevChar.length > 1 || !isWhitespaceCode(runPrevChar.charCodeAt(0)))
         && (!!nextChar || (delimChar === '*' && !runPrevPunct));
       const endReg = delimChar === '*' ? inlineRules.emStrongRDelimAst : inlineRules.emStrongRDelimUnd;
       const lastPossibleCloser = lastPossibleEmStrongCloser(this, maskedSrc, delimChar);
@@ -1842,7 +1912,7 @@ class Tokenizer {
 
     const nextChar = match[1] || '';
 
-    if (!nextChar || !prevChar || inlineRules.punctuation.exec(prevChar)) {
+    if (!nextChar || !prevChar || isPunctOrSpace(prevChar)) {
       // The opener is a run of ASCII tildes plus one trailing code point,
       // so its length is the match length minus one, minus one more when
       // that trailing code point is astral (two code units).
@@ -2009,6 +2079,10 @@ for (let c = 48; c <= 57; c++) blockSpecial[c] = 1;
 // strikethrough, or an autolink (www., ://, or an email @). A run holding
 // none of these is a single text token.
 const inlineTrigger = /[\\<!\[`*~_]|  \n|@|:\/\/|www\./;
+
+// An emphasis or strikethrough delimiter: only runs holding one need the
+// masked source and the closer scan.
+const hasDelim = /[*_~]/;
 
 /* ------------------------------------------------------------------ */
 /* Lexer — block and inline passes                                     */
@@ -2259,19 +2333,11 @@ class Lexer {
   }
 
   inlineTokens(src, tokens = []) {
-    // One paren scan per inline run, shared with Tokenizer.link: without a
-    // ')' ahead the link regex cannot match, and skipping it avoids its
-    // quadratic backtracking over unterminated-link inputs like
-    // `'[a](b'.repeat(n)`. A nested run receives a substring of the outer
-    // run, so if the outer had no ')' neither does this substring — skip
-    // the scan in that case.
-    const prevLinkParenPossible = this.state.linkParenPossible;
-    this.state.linkParenPossible = prevLinkParenPossible && src.includes(')');
-
-    // Fast path: with no inline trigger anywhere — no escape, tag, link,
-    // emphasis, code, break, strikethrough or autolink start — the run is
-    // a single text token, which is exactly what the loop below would
-    // produce one chunk at a time.
+    // Fast path first: with no inline trigger anywhere — no escape, tag,
+    // link, emphasis, code, break, strikethrough or autolink start — the
+    // run is a single text token, which is exactly what the loop below
+    // would produce one chunk at a time. It needs neither the paren scan
+    // nor the closer frame, so both stay out of the way.
     if (src !== '' && !inlineTrigger.test(src)) {
       const escaped = this.state.inRawBlock;
       const token = {
@@ -2287,16 +2353,24 @@ class Lexer {
       } else {
         tokens.push(token);
       }
-      this.state.linkParenPossible = prevLinkParenPossible;
       return tokens;
     }
+
+    // One paren scan per inline run, shared with Tokenizer.link: without a
+    // ')' ahead the link regex cannot match, and skipping it avoids its
+    // quadratic backtracking over unterminated-link inputs like
+    // `'[a](b'.repeat(n)`. A nested run receives a substring of the outer
+    // run, so if the outer had no ')' neither does this substring — skip
+    // the scan in that case.
+    const prevLinkParenPossible = this.state.linkParenPossible;
+    this.state.linkParenPossible = prevLinkParenPossible && src.includes(')');
 
     // The masked source is only read by emStrong and del, which need a *, _ or
     // ~ to start. Skip building it for a run without one — and skip the closer
     // scan too, since neither emStrong nor del can run there either (the
     // dispatch only calls them at those characters, and nested runs hold
     // substrings of the outer run, so they cannot gain one).
-    const hasDelims = src.includes('*') || src.includes('_') || src.includes('~');
+    const hasDelims = hasDelim.test(src);
     const maskedSrc = hasDelims ? this.maskSrc(src) : src;
 
     // One scan of this maskedSrc for the last emphasis, strong, and
@@ -2509,7 +2583,11 @@ class Lexer {
           return '+'.repeat(match0.length);
         }
         if (code) {
-          return code + match0.slice(code.length, -code.length).replace(/`/g, '+') + code;
+          // A code span's inner backticks are masked so blockSkip still
+          // skips all of it; without an inner backtick the span is already
+          // what the mask would produce.
+          const inner = match0.slice(code.length, -code.length);
+          return inner.includes('`') ? code + inner.replace(/`/g, '+') + code : match0;
         }
         return match0;
       });
