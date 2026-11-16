@@ -1833,6 +1833,31 @@ class Tokenizer {
 }
 
 /* ------------------------------------------------------------------ */
+/* First-character dispatch tables                                     */
+/* ------------------------------------------------------------------ */
+
+// Inline loop: which tokenizers can match at a given starting character.
+// 0 = backslash, 1 = '<', 2 = '[' or '!', 3 = '*' or '_', 4 = backtick,
+// 5 = '~', 6 = space, 7 = anything else. Every inline tokenizer except
+// `text` (and `url`, which needs a letter, digit or . _ + -) is anchored
+// to one of these, so the loop only runs the tokenizers that can match.
+const inlineBucket = new Uint8Array(128).fill(7);
+inlineBucket[92] = 0; // backslash
+inlineBucket[60] = 1; // <
+inlineBucket[91] = 2; inlineBucket[33] = 2; // [ !
+inlineBucket[42] = 3; inlineBucket[95] = 3; // * _
+inlineBucket[96] = 4; // backtick
+inlineBucket[126] = 5; // ~
+inlineBucket[32] = 6; // space
+
+// Block loop: 1 when a block tokenizer other than table/lheading/paragraph/
+// text could match at this character (space, tab, newline, or a marker).
+// Characters at code 128 and above are never special here.
+const blockSpecial = new Uint8Array(128);
+for (const c of [9, 10, 32, 35, 42, 43, 45, 60, 62, 91, 95, 96, 126]) blockSpecial[c] = 1;
+for (let c = 48; c <= 57; c++) blockSpecial[c] = 1;
+
+/* ------------------------------------------------------------------ */
 /* Lexer — block and inline passes                                     */
 /* ------------------------------------------------------------------ */
 
@@ -1885,8 +1910,16 @@ class Lexer {
 
       let token;
 
+      // Dispatch on the first character: space, code, fences, heading, hr,
+      // blockquote, list, html and def are all anchored to a space, tab,
+      // newline or a specific marker character. When the input starts with
+      // anything else, only table, lheading, paragraph and text can match,
+      // so the rest are skipped.
+      const c0 = src.charCodeAt(0);
+      const plainStart = c0 >= 128 || blockSpecial[c0] === 0;
+
       // newline
-      if (token = this.tokenizer.space(src)) {
+      if (!plainStart && (token = this.tokenizer.space(src))) {
         src = src.substring(token.raw.length);
         const lastToken = tokens.at(-1);
         if (token.raw.length === 1 && lastToken !== undefined) {
@@ -1900,7 +1933,7 @@ class Lexer {
       }
 
       // code
-      if (token = this.tokenizer.code(src)) {
+      if (!plainStart && (token = this.tokenizer.code(src))) {
         src = src.substring(token.raw.length);
         const lastToken = tokens.at(-1);
         // An indented code block cannot interrupt a paragraph.
@@ -1915,49 +1948,49 @@ class Lexer {
       }
 
       // fences
-      if (token = this.tokenizer.fences(src)) {
+      if (!plainStart && (token = this.tokenizer.fences(src))) {
         src = src.substring(token.raw.length);
         tokens.push(token);
         continue;
       }
 
       // heading
-      if (token = this.tokenizer.heading(src)) {
+      if (!plainStart && (token = this.tokenizer.heading(src))) {
         src = src.substring(token.raw.length);
         tokens.push(token);
         continue;
       }
 
       // hr
-      if (token = this.tokenizer.hr(src)) {
+      if (!plainStart && (token = this.tokenizer.hr(src))) {
         src = src.substring(token.raw.length);
         tokens.push(token);
         continue;
       }
 
       // blockquote
-      if (token = this.tokenizer.blockquote(src)) {
+      if (!plainStart && (token = this.tokenizer.blockquote(src))) {
         src = src.substring(token.raw.length);
         tokens.push(token);
         continue;
       }
 
       // list
-      if (token = this.tokenizer.list(src)) {
+      if (!plainStart && (token = this.tokenizer.list(src))) {
         src = src.substring(token.raw.length);
         tokens.push(token);
         continue;
       }
 
       // html
-      if (token = this.tokenizer.html(src)) {
+      if (!plainStart && (token = this.tokenizer.html(src))) {
         src = src.substring(token.raw.length);
         tokens.push(token);
         continue;
       }
 
       // def
-      if (token = this.tokenizer.def(src)) {
+      if (!plainStart && (token = this.tokenizer.def(src))) {
         src = src.substring(token.raw.length);
         const lastToken = tokens.at(-1);
         if (lastToken?.type === 'paragraph' || lastToken?.type === 'text') {
@@ -2123,77 +2156,86 @@ class Lexer {
 
       let token;
 
-      // escape
-      if (token = this.tokenizer.escape(src)) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
-        continue;
-      }
-
-      // tag
-      if (token = this.tokenizer.tag(src)) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
-        continue;
-      }
-
-      // link
-      if (token = this.tokenizer.link(src)) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
-        continue;
-      }
-
-      // reflink, nolink
-      if (token = this.tokenizer.reflink(src, this.tokens.links)) {
-        src = src.substring(token.raw.length);
-        const lastToken = tokens.at(-1);
-        if (token.type === 'text' && lastToken?.type === 'text') {
-          lastToken.raw += token.raw;
-          lastToken.text += token.text;
-        } else {
+      // Dispatch on the first character (see inlineBucket): every inline
+      // tokenizer except `text` is anchored to a specific starting character,
+      // so tokenizers that cannot match here are never run. Order within a
+      // bucket follows marked's: escape, tag, link, reflink, emStrong,
+      // codespan, br, del, autolink, url, text. `url` may also start at `_`
+      // (an email address), so it is tried there after emStrong.
+      const c0 = src.charCodeAt(0);
+      const bucket = c0 < 128 ? inlineBucket[c0] : 7;
+      if (bucket === 0) { // backslash: escape, br
+        if (token = this.tokenizer.escape(src)) {
+          src = src.substring(token.raw.length);
           tokens.push(token);
+          continue;
         }
-        continue;
-      }
-
-      // em & strong
-      if (token = this.tokenizer.emStrong(src, maskedSrc, prevChar)) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
-        continue;
-      }
-
-      // code
-      if (token = this.tokenizer.codespan(src)) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
-        continue;
-      }
-
-      // br
-      if (token = this.tokenizer.br(src)) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
-        continue;
-      }
-
-      // del (gfm)
-      if (token = this.tokenizer.del(src, maskedSrc, prevChar)) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
-        continue;
-      }
-
-      // autolink
-      if (token = this.tokenizer.autolink(src)) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
-        continue;
-      }
-
-      // url (gfm)
-      if (!this.state.inLink && (token = this.tokenizer.url(src))) {
+        if (token = this.tokenizer.br(src)) {
+          src = src.substring(token.raw.length);
+          tokens.push(token);
+          continue;
+        }
+      } else if (bucket === 1) { // <: tag, autolink
+        if (token = this.tokenizer.tag(src)) {
+          src = src.substring(token.raw.length);
+          tokens.push(token);
+          continue;
+        }
+        if (token = this.tokenizer.autolink(src)) {
+          src = src.substring(token.raw.length);
+          tokens.push(token);
+          continue;
+        }
+      } else if (bucket === 2) { // [ or !: link, reflink
+        if (token = this.tokenizer.link(src)) {
+          src = src.substring(token.raw.length);
+          tokens.push(token);
+          continue;
+        }
+        if (token = this.tokenizer.reflink(src, this.tokens.links)) {
+          src = src.substring(token.raw.length);
+          const lastToken = tokens.at(-1);
+          if (token.type === 'text' && lastToken?.type === 'text') {
+            lastToken.raw += token.raw;
+            lastToken.text += token.text;
+          } else {
+            tokens.push(token);
+          }
+          continue;
+        }
+      } else if (bucket === 3) { // * or _: emStrong, then url at _
+        if (token = this.tokenizer.emStrong(src, maskedSrc, prevChar)) {
+          src = src.substring(token.raw.length);
+          tokens.push(token);
+          continue;
+        }
+        if (c0 === 95 && !this.state.inLink && (token = this.tokenizer.url(src))) {
+          src = src.substring(token.raw.length);
+          tokens.push(token);
+          continue;
+        }
+      } else if (bucket === 4) { // backtick: codespan
+        if (token = this.tokenizer.codespan(src)) {
+          src = src.substring(token.raw.length);
+          tokens.push(token);
+          continue;
+        }
+      } else if (bucket === 5) { // ~: del
+        if (token = this.tokenizer.del(src, maskedSrc, prevChar)) {
+          src = src.substring(token.raw.length);
+          tokens.push(token);
+          continue;
+        }
+      } else if (bucket === 6) { // space: br
+        if (token = this.tokenizer.br(src)) {
+          src = src.substring(token.raw.length);
+          tokens.push(token);
+          continue;
+        }
+      } else if (!this.state.inLink // anything else: url, then text
+        && (c0 === 46 || c0 === 43 || c0 === 45
+          || (c0 >= 48 && c0 <= 57) || (c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122))
+        && (token = this.tokenizer.url(src))) {
         src = src.substring(token.raw.length);
         tokens.push(token);
         continue;
