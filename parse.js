@@ -1134,7 +1134,10 @@ class Tokenizer {
 
         const firstLine = uptoNewline(cap[2]);
         const bulletIndent = cap[1].length;
-        let line = firstLine.replace(misc.leadingSpaceTab, (whitespace) => expandTabs(whitespace, bulletIndent));
+        // Expand leading tabs (to the bullet's column) only when a tab is present.
+        let line = firstLine.includes('\t')
+          ? firstLine.replace(misc.leadingSpaceTab, (whitespace) => expandTabs(whitespace, bulletIndent))
+          : firstLine;
         let nextLine = uptoNewline(src);
         let blankLine = isBlankLine(line);
 
@@ -1173,7 +1176,7 @@ class Tokenizer {
             // could pass; a letter or other ordinary character passes none.
             // Every test just breaks, so their order does not matter.
             let leadSpaces = 0;
-            while (leadSpaces < nextLine.length && leadSpaces <= indent && nextLine[leadSpaces] === ' ') leadSpaces++;
+            while (leadSpaces < nextLine.length && nextLine[leadSpaces] === ' ') leadSpaces++;
             const marker = leadSpaces <= indent ? nextLine.charCodeAt(leadSpaces) : -1;
             if (marker === 96 || marker === 126) { // ` or ~: fences
               if (fencesBeginRegex.test(nextLine)) break;
@@ -1190,12 +1193,23 @@ class Tokenizer {
               if (hrRegex.test(nextLine)) break;
             }
 
-            // Re-align to follow commonmark nesting rules.
-            const nextLineWithoutTabs = nextLine.replace(misc.leadingSpaceTab, (whitespace) => expandTabs(whitespace));
+            // Re-align to follow commonmark nesting rules. Tabs in the leading
+            // whitespace expand to the next tab stop; without a tab anywhere
+            // the line is unchanged, and its first non-space character is the
+            // one the dispatch scan above already found.
+            const hasTab = nextLine.includes('\t');
+            const nextLineWithoutTabs = hasTab
+              ? nextLine.replace(misc.leadingSpaceTab, (whitespace) => expandTabs(whitespace))
+              : nextLine;
             const lineIsBlank = isBlankLine(nextLine);
-            let firstNonSpace = -1;
-            for (let k = 0; k < nextLineWithoutTabs.length; k++) {
-              if (nextLineWithoutTabs[k] !== ' ') { firstNonSpace = k; break; }
+            let firstNonSpace;
+            if (hasTab) {
+              firstNonSpace = -1;
+              for (let k = 0; k < nextLineWithoutTabs.length; k++) {
+                if (nextLineWithoutTabs[k] !== ' ') { firstNonSpace = k; break; }
+              }
+            } else {
+              firstNonSpace = leadSpaces === nextLine.length ? -1 : leadSpaces;
             }
 
             if (firstNonSpace >= indent || lineIsBlank) { // Dedent if possible.
@@ -1284,9 +1298,14 @@ class Tokenizer {
         item.tokens = this.lexer.blockTokens(item.text, []);
 
         if (!list.loose) {
-          // Check if list should be loose.
-          const spacers = item.tokens.filter((t) => t.type === 'space');
-          const hasMultipleLineBreaks = spacers.length > 0 && spacers.some((t) => hasTwoNewlines(t.raw));
+          // Check if list should be loose: any spacer holding two newlines.
+          let hasMultipleLineBreaks = false;
+          for (const t of item.tokens) {
+            if (t.type === 'space' && hasTwoNewlines(t.raw)) {
+              hasMultipleLineBreaks = true;
+              break;
+            }
+          }
 
           list.loose = hasMultipleLineBreaks;
         }
@@ -1708,7 +1727,7 @@ class Tokenizer {
     const prevPunct = runStart < srcStart ? runPrevPunct : !!inlineRules.punctuation.exec(prevChar);
 
     // _ can't be between two alphanumerics. \p{L}\p{N} includes non-english alphabet/numbers as well.
-    if (match[4] && prevChar.match(misc.unicodeAlphaNumeric)) return;
+    if (match[4] && misc.unicodeAlphaNumeric.test(prevChar)) return;
 
     const nextChar = match[1] || match[3] || '';
 
@@ -1985,6 +2004,12 @@ const blockSpecial = new Uint8Array(128);
 for (const c of [9, 10, 32, 35, 42, 43, 45, 60, 62, 91, 95, 96, 126]) blockSpecial[c] = 1;
 for (let c = 48; c <= 57; c++) blockSpecial[c] = 1;
 
+// Anything that can start a non-text inline token: an escape, a tag, a link,
+// emphasis, a code span, a hard break (two spaces and a newline), a
+// strikethrough, or an autolink (www., ://, or an email @). A run holding
+// none of these is a single text token.
+const inlineTrigger = /[\\<!\[`*~_]|  \n|@|:\/\/|www\./;
+
 /* ------------------------------------------------------------------ */
 /* Lexer — block and inline passes                                     */
 /* ------------------------------------------------------------------ */
@@ -2031,8 +2056,6 @@ class Lexer {
   }
 
   blockTokens(src, tokens = [], lastParagraphClipped = false) {
-    this.tokenizer.lexer = this;
-
     let srcLength = Infinity;
     while (src) {
       if (src.length < srcLength) {
@@ -2236,7 +2259,6 @@ class Lexer {
   }
 
   inlineTokens(src, tokens = []) {
-    this.tokenizer.lexer = this;
     // One paren scan per inline run, shared with Tokenizer.link: without a
     // ')' ahead the link regex cannot match, and skipping it avoids its
     // quadratic backtracking over unterminated-link inputs like
@@ -2245,16 +2267,30 @@ class Lexer {
     // the scan in that case.
     const prevLinkParenPossible = this.state.linkParenPossible;
     this.state.linkParenPossible = prevLinkParenPossible && src.includes(')');
-    try {
-      return this.inlineTokensInner(src, tokens);
-    } finally {
-      // A nested run (e.g. a link label) anchored on its own substring;
-      // restore the outer run's flag for the rest of its loop.
-      this.state.linkParenPossible = prevLinkParenPossible;
-    }
-  }
 
-  inlineTokensInner(src, tokens) {
+    // Fast path: with no inline trigger anywhere — no escape, tag, link,
+    // emphasis, code, break, strikethrough or autolink start — the run is
+    // a single text token, which is exactly what the loop below would
+    // produce one chunk at a time.
+    if (src !== '' && !inlineTrigger.test(src)) {
+      const escaped = this.state.inRawBlock;
+      const token = {
+        type: 'text',
+        raw: src,
+        text: escaped ? src : decodeNumericCharacterReferences(src),
+        escaped,
+      };
+      const lastToken = tokens.at(-1);
+      if (lastToken?.type === 'text') {
+        lastToken.raw += token.raw;
+        lastToken.text += token.text;
+      } else {
+        tokens.push(token);
+      }
+      this.state.linkParenPossible = prevLinkParenPossible;
+      return tokens;
+    }
+
     // The masked source is only read by emStrong and del, which need a *, _ or
     // ~ to start. Skip building it for a run without one — and skip the closer
     // scan too, since neither emStrong nor del can run there either (the
@@ -2262,19 +2298,23 @@ class Lexer {
     // substrings of the outer run, so they cannot gain one).
     const hasDelims = src.includes('*') || src.includes('_') || src.includes('~');
     const maskedSrc = hasDelims ? this.maskSrc(src) : src;
-    if (!hasDelims) {
-      return this.tokenizeInlines(src, maskedSrc, tokens);
-    }
 
     // One scan of this maskedSrc for the last emphasis, strong, and
-    // strikethrough closers, shared by every opener in the pass. Popped
-    // when the pass ends so the source is not retained.
-    beginCloserScan(this.tokenizer, maskedSrc);
-    try {
-      return this.tokenizeInlines(src, maskedSrc, tokens);
-    } finally {
+    // strikethrough closers, shared by every opener in the pass.
+    if (hasDelims) {
+      beginCloserScan(this.tokenizer, maskedSrc);
+    }
+    // No try/finally: the only way out besides a normal return is a throw,
+    // which aborts the whole parse (nothing catches it), so the restores
+    // below are unreachable then and the per-parse state dies with it.
+    const result = this.tokenizeInlines(src, maskedSrc, tokens);
+    if (hasDelims) {
       endCloserScan(this.tokenizer);
     }
+    // A nested run (e.g. a link label) anchored on its own substring;
+    // restore the outer run's flag for the rest of its loop.
+    this.state.linkParenPossible = prevLinkParenPossible;
+    return result;
   }
 
   tokenizeInlines(src, maskedSrc, tokens) {
@@ -2303,81 +2343,100 @@ class Lexer {
       // (an email address), so it is tried there after emStrong.
       const c0 = src.charCodeAt(0);
       const bucket = c0 < 128 ? inlineBucket[c0] : 7;
-      if (bucket === 0) { // backslash: escape, br
-        if (token = this.tokenizer.escape(src)) {
-          src = src.substring(token.raw.length);
-          tokens.push(token);
-          continue;
-        }
-        if (token = this.tokenizer.br(src)) {
-          src = src.substring(token.raw.length);
-          tokens.push(token);
-          continue;
-        }
-      } else if (bucket === 1) { // <: tag, autolink
-        if (token = this.tokenizer.tag(src)) {
-          src = src.substring(token.raw.length);
-          tokens.push(token);
-          continue;
-        }
-        if (token = this.tokenizer.autolink(src)) {
-          src = src.substring(token.raw.length);
-          tokens.push(token);
-          continue;
-        }
-      } else if (bucket === 2) { // [ or !: link, reflink
-        if (token = this.tokenizer.link(src)) {
-          src = src.substring(token.raw.length);
-          tokens.push(token);
-          continue;
-        }
-        if (token = this.tokenizer.reflink(src, this.tokens.links)) {
-          src = src.substring(token.raw.length);
-          const lastToken = tokens.at(-1);
-          if (token.type === 'text' && lastToken?.type === 'text') {
-            lastToken.raw += token.raw;
-            lastToken.text += token.text;
-          } else {
+      switch (bucket) {
+        case 0: { // backslash: escape, br
+          if (token = this.tokenizer.escape(src)) {
+            src = src.substring(token.raw.length);
             tokens.push(token);
+            continue;
           }
-          continue;
+          if (token = this.tokenizer.br(src)) {
+            src = src.substring(token.raw.length);
+            tokens.push(token);
+            continue;
+          }
+          break;
         }
-      } else if (bucket === 3) { // * or _: emStrong, then url at _
-        if (token = this.tokenizer.emStrong(src, maskedSrc, prevChar)) {
-          src = src.substring(token.raw.length);
-          tokens.push(token);
-          continue;
+        case 1: { // <: tag, autolink
+          if (token = this.tokenizer.tag(src)) {
+            src = src.substring(token.raw.length);
+            tokens.push(token);
+            continue;
+          }
+          if (token = this.tokenizer.autolink(src)) {
+            src = src.substring(token.raw.length);
+            tokens.push(token);
+            continue;
+          }
+          break;
         }
-        if (c0 === 95 && !this.state.inLink && (token = this.tokenizer.url(src))) {
-          src = src.substring(token.raw.length);
-          tokens.push(token);
-          continue;
+        case 2: { // [ or !: link, reflink
+          if (token = this.tokenizer.link(src)) {
+            src = src.substring(token.raw.length);
+            tokens.push(token);
+            continue;
+          }
+          if (token = this.tokenizer.reflink(src, this.tokens.links)) {
+            src = src.substring(token.raw.length);
+            const lastToken = tokens.at(-1);
+            if (token.type === 'text' && lastToken?.type === 'text') {
+              lastToken.raw += token.raw;
+              lastToken.text += token.text;
+            } else {
+              tokens.push(token);
+            }
+            continue;
+          }
+          break;
         }
-      } else if (bucket === 4) { // backtick: codespan
-        if (token = this.tokenizer.codespan(src)) {
-          src = src.substring(token.raw.length);
-          tokens.push(token);
-          continue;
+        case 3: { // * or _: emStrong, then url at _
+          if (token = this.tokenizer.emStrong(src, maskedSrc, prevChar)) {
+            src = src.substring(token.raw.length);
+            tokens.push(token);
+            continue;
+          }
+          if (c0 === 95 && !this.state.inLink && (token = this.tokenizer.url(src))) {
+            src = src.substring(token.raw.length);
+            tokens.push(token);
+            continue;
+          }
+          break;
         }
-      } else if (bucket === 5) { // ~: del
-        if (token = this.tokenizer.del(src, maskedSrc, prevChar)) {
-          src = src.substring(token.raw.length);
-          tokens.push(token);
-          continue;
+        case 4: { // backtick: codespan
+          if (token = this.tokenizer.codespan(src)) {
+            src = src.substring(token.raw.length);
+            tokens.push(token);
+            continue;
+          }
+          break;
         }
-      } else if (bucket === 6) { // space: br
-        if (token = this.tokenizer.br(src)) {
-          src = src.substring(token.raw.length);
-          tokens.push(token);
-          continue;
+        case 5: { // ~: del
+          if (token = this.tokenizer.del(src, maskedSrc, prevChar)) {
+            src = src.substring(token.raw.length);
+            tokens.push(token);
+            continue;
+          }
+          break;
         }
-      } else if (!this.state.inLink // anything else: url, then text
-        && (c0 === 46 || c0 === 43 || c0 === 45
-          || (c0 >= 48 && c0 <= 57) || (c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122))
-        && (token = this.tokenizer.url(src))) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
-        continue;
+        case 6: { // space: br
+          if (token = this.tokenizer.br(src)) {
+            src = src.substring(token.raw.length);
+            tokens.push(token);
+            continue;
+          }
+          break;
+        }
+        default: { // anything else: url, then text
+          if (!this.state.inLink
+            && (c0 === 46 || c0 === 43 || c0 === 45
+              || (c0 >= 48 && c0 <= 57) || (c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122))
+            && (token = this.tokenizer.url(src))) {
+            src = src.substring(token.raw.length);
+            tokens.push(token);
+            continue;
+          }
+          break;
+        }
       }
 
       // text
@@ -2412,8 +2471,8 @@ class Lexer {
     let maskedSrc = src;
 
     // Mask out reflinks. Without a stored definition no candidate can match,
-    // so the whole pass is skipped.
-    if (this.hasLinks && src.includes('[')) {
+    // and without a ']' no label can close, so the whole pass is skipped.
+    if (this.hasLinks && src.includes('[') && src.includes(']')) {
       const reflinkSearch = inlineRules.reflinkSearch;
       const maskReflink = (match0) => {
         const refStart = match0.lastIndexOf('[');
