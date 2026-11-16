@@ -125,6 +125,9 @@ const misc = {
   notSpaceStart: /^\S*/,
   endingNewline: /\n$/,
   listItemRegex: (bull) => new RegExp(`^( {0,3}${bull})((?:[\t ][^\\n]*)?(?:\\n|$))`),
+  // A setext underline (up to 3 leading spaces, = or - run, trailing spaces).
+  setextUnderline: /^ {0,3}(?:=+|-+) *$/,
+  leadingThreeSpaces: /^ {0,3}/,
   nextBulletRegex: cachedIndentRegex((indent) => new RegExp(`^ {0,${indent}}(?:[*+-]|\\d{1,9}[.)])((?:[ \t][^\\n]*)?(?:\\n|$))`)),
   hrRegex: cachedIndentRegex((indent) => new RegExp(`^ {0,${indent}}((?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\\*[ \t]*){3,})(?:\\n+|$)`)),
   fencesBeginRegex: cachedIndentRegex((indent) => new RegExp(`^ {0,${indent}}(?:\`\`\`|~~~)`)),
@@ -734,6 +737,18 @@ function isAlphaNumericChar(ch) {
   return misc.unicodeAlphaNumeric.test(ch);
 }
 
+// True when the leading whitespace run of `s` (spaces and tabs up to the
+// first other character) holds a tab. Only that run matters to the
+// leading-whitespace tab expansion.
+function hasLeadingTab(s) {
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '\t') return true;
+    if (c !== ' ') return false;
+  }
+  return false;
+}
+
 // Exactly what String.prototype.trim tests for a single code point: the
 // White_Space set plus line terminators. An astral code point is never one.
 function isWhitespaceCode(c) {
@@ -1204,8 +1219,10 @@ class Tokenizer {
 
         const firstLine = uptoNewline(cap[2]);
         const bulletIndent = cap[1].length;
-        // Expand leading tabs (to the bullet's column) only when a tab is present.
-        let line = firstLine.includes('\t')
+        // Expand leading tabs (to the bullet's column) only when a tab sits
+        // in the leading whitespace — the replace only touches that run, so
+        // a tab further along the line cannot change it.
+        let line = hasLeadingTab(firstLine)
           ? firstLine.replace(misc.leadingSpaceTab, (whitespace) => expandTabs(whitespace, bulletIndent))
           : firstLine;
         let nextLine = uptoNewline(src);
@@ -1264,10 +1281,12 @@ class Tokenizer {
             }
 
             // Re-align to follow commonmark nesting rules. Tabs in the leading
-            // whitespace expand to the next tab stop; without a tab anywhere
-            // the line is unchanged, and its first non-space character is the
-            // one the dispatch scan above already found.
-            const hasTab = nextLine.includes('\t');
+            // whitespace expand to the next tab stop; without a tab there
+            // the line is unchanged, and its first non-space character is
+            // the one the dispatch scan above already found. The scan stops
+            // at the first non-space character, so a tab there is exactly
+            // a tab in the leading run.
+            const hasTab = nextLine.charCodeAt(leadSpaces) === 9;
             const nextLineWithoutTabs = hasTab
               ? nextLine.replace(misc.leadingSpaceTab, (whitespace) => expandTabs(whitespace))
               : nextLine;
@@ -1311,10 +1330,10 @@ class Tokenizer {
 
               // A lazy continuation can look like a setext underline after
               // list indentation is removed. Keep it in the paragraph.
-              const setextContinuation = /^ {0,3}(?:=+|-+) *$/.test(nextLine)
+              const setextContinuation = misc.setextUnderline.test(nextLine)
                 && blockRules.lheading.test(`${line}\n${nextLine}`);
               const continuation = setextContinuation
-                ? `    ${nextLineWithoutTabs.replace(/^ {0,3}/, '')}`
+                ? `    ${nextLineWithoutTabs.replace(misc.leadingThreeSpaces, '')}`
                 : nextLine;
               itemContents += '\n' + continuation;
             }
