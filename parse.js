@@ -484,7 +484,9 @@ function escapeHtmlEntities(html, encode) {
     if (misc.escapeTest.test(html)) {
       return html.replace(misc.escapeReplace, getEscapeReplacement);
     }
-  } else if (misc.escapeTestNoEncode.test(html)) {
+  } else if (misc.escapeTest.test(html) && misc.escapeTestNoEncode.test(html)) {
+    // Cheap pre-filter first: without any of & < > " ' there is nothing to
+    // escape, and the precise test (with its entity lookahead) need not run.
     return html.replace(misc.escapeReplaceNoEncode, getEscapeReplacement);
   }
   return html;
@@ -1633,7 +1635,12 @@ class Tokenizer {
     while (runStart > 0 && maskedSrc[runStart - 1] === delimChar) {
       runStart--;
     }
-    const runPrevChar = [...maskedSrc.slice(Math.max(0, runStart - 2), runStart)].at(-1) ?? '';
+    // The last code point before the run (a surrogate pair counts as one).
+    const runPrevSlice = maskedSrc.slice(Math.max(0, runStart - 2), runStart);
+    const runPrevChar = runPrevSlice.length === 0 ? ''
+      : (runPrevSlice.length === 2 && runPrevSlice.charCodeAt(0) >= 0xd800 && runPrevSlice.charCodeAt(0) <= 0xdbff
+        && runPrevSlice.charCodeAt(1) >= 0xdc00 && runPrevSlice.charCodeAt(1) <= 0xdfff
+        ? runPrevSlice : runPrevSlice.slice(-1));
     // The other delimiter character counts as punctuation here (`_**a*`).
     const runPrevPunct = runPrevChar === '*' || runPrevChar === '_' || !!inlineRules.punctuation.exec(runPrevChar);
     if (runStart < srcStart) {
@@ -1647,8 +1654,11 @@ class Tokenizer {
     const nextChar = match[1] || match[3] || '';
 
     if (!nextChar || !prevChar || prevPunct) {
-      // Unicode Regex counts emoji as 1 char; spread into array for proper count (used multiple times below).
-      const lLength = [...match[0]].length - 1;
+      // The opener is a run of ASCII delimiters plus one trailing code
+      // point, so its length is the match length minus one, minus one more
+      // when that trailing code point is astral (two code units).
+      let lLength = match[0].length - 1;
+      if (match[0].codePointAt(match[0].length - 2) > 0xffff) lLength--;
       let rDelim, rLength, delimTotal = lLength, midDelimTotal = 0;
 
       // Rules 9-10 count the whole run, and also apply when the opener could
@@ -1671,7 +1681,7 @@ class Tokenizer {
 
         if (!rDelim) continue; // Skip single * in __abc*abc__.
 
-        rLength = [...rDelim].length;
+        rLength = rDelim.length; // A delimiter run is ASCII only.
 
         if (match[3] || match[4]) { // Found another Left Delim.
           delimTotal += rLength;
@@ -1695,7 +1705,7 @@ class Tokenizer {
         // Remove extra characters. *a*** -> *a*
         rLength = Math.min(rLength, rLength + delimTotal + midDelimTotal);
         // Char length can be >1 for unicode characters.
-        const lastCharLength = [...match[0]][0].length;
+        const lastCharLength = match[0].codePointAt(0) > 0xffff ? 2 : 1;
         const raw = src.slice(0, lLength + match.index + lastCharLength + rLength);
 
         // Create `em` if smallest delimiter has odd char count. *a***
@@ -1755,8 +1765,11 @@ class Tokenizer {
     const nextChar = match[1] || '';
 
     if (!nextChar || !prevChar || inlineRules.punctuation.exec(prevChar)) {
-      // Unicode Regex counts emoji as 1 char; spread into array for proper count.
-      const lLength = [...match[0]].length - 1;
+      // The opener is a run of ASCII tildes plus one trailing code point,
+      // so its length is the match length minus one, minus one more when
+      // that trailing code point is astral (two code units).
+      let lLength = match[0].length - 1;
+      if (match[0].codePointAt(match[0].length - 2) > 0xffff) lLength--;
       let rDelim, rLength, delimTotal = lLength;
 
       const endReg = inlineRules.delRDelim;
@@ -1774,7 +1787,7 @@ class Tokenizer {
 
         if (!rDelim) continue;
 
-        rLength = [...rDelim].length;
+        rLength = rDelim.length; // A delimiter run is ASCII only.
 
         if (rLength !== lLength) continue;
 
@@ -1790,7 +1803,7 @@ class Tokenizer {
         // Remove extra characters.
         rLength = Math.min(rLength, rLength + delimTotal);
         // Char length can be >1 for unicode characters.
-        const lastCharLength = [...match[0]][0].length;
+        const lastCharLength = match[0].codePointAt(0) > 0xffff ? 2 : 1;
         const raw = src.slice(0, lLength + match.index + lastCharLength + rLength);
 
         // Create del token - only single ~ or double ~~ supported.
@@ -2359,21 +2372,27 @@ class Lexer {
     // unicode punctuation, so an escaped astral character is 3 code units.
     // A backslash inside a code span is literal, not an escape. Mask the
     // backticks inside the span instead, so blockSkip still skips all of it.
-    maskedSrc = maskedSrc.replace(inlineRules.anyPunctuationOutsideCode, (match0, code, punct) => {
-      if (punct) {
-        return '+'.repeat(match0.length);
-      }
-      if (code) {
-        return code + match0.slice(code.length, -code.length).replace(/`/g, '+') + code;
-      }
-      return match0;
-    });
+    // The pattern can only match where a backtick or a backslash sits.
+    if (maskedSrc.includes('`') || maskedSrc.includes('\\')) {
+      maskedSrc = maskedSrc.replace(inlineRules.anyPunctuationOutsideCode, (match0, code, punct) => {
+        if (punct) {
+          return '+'.repeat(match0.length);
+        }
+        if (code) {
+          return code + match0.slice(code.length, -code.length).replace(/`/g, '+') + code;
+        }
+        return match0;
+      });
+    }
 
-    // Mask out other blocks.
-    maskedSrc = maskedSrc.replace(inlineRules.blockSkip, (match0, _link, context) => {
-      const offset = context ? context.length : 0;
-      return match0.slice(0, offset) + '[' + 'a'.repeat(match0.length - offset - 2) + ']';
-    });
+    // Mask out other blocks. blockSkip can only match a link (needs `[`),
+    // a code span (needs a backtick) or html (needs `<`).
+    if (maskedSrc.includes('[') || maskedSrc.includes('`') || maskedSrc.includes('<')) {
+      maskedSrc = maskedSrc.replace(inlineRules.blockSkip, (match0, _link, context) => {
+        const offset = context ? context.length : 0;
+        return match0.slice(0, offset) + '[' + 'a'.repeat(match0.length - offset - 2) + ']';
+      });
+    }
 
     return maskedSrc;
   }
