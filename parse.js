@@ -2395,6 +2395,12 @@ class Lexer {
     let keepPrevChar = false;
     let prevChar = '';
     let srcLength = Infinity;
+    // The link regex needs '](' after the label. Once the remainder holds
+    // none, no later remainder can either (remainders only shrink), so the
+    // regex is never tried again in this run. Checked lazily at the first
+    // '[' so runs without one pay nothing.
+    let linkChecked = false;
+    let linkPossible = true;
     while (src) {
       if (src.length < srcLength) {
         srcLength = src.length;
@@ -2445,10 +2451,16 @@ class Lexer {
           break;
         }
         case 2: { // [ or !: link, reflink
-          if (token = this.tokenizer.link(src)) {
-            src = src.substring(token.raw.length);
-            tokens.push(token);
-            continue;
+          if (linkPossible) {
+            if (!linkChecked) {
+              linkChecked = true;
+              if (!src.includes('](')) linkPossible = false;
+            }
+            if (linkPossible && (token = this.tokenizer.link(src))) {
+              src = src.substring(token.raw.length);
+              tokens.push(token);
+              continue;
+            }
           }
           if (token = this.tokenizer.reflink(src, this.tokens.links)) {
             src = src.substring(token.raw.length);
