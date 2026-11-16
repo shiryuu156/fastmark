@@ -724,6 +724,62 @@ function expandTabs(line, indent = 0) {
   return expanded;
 }
 
+// The part of `s` before its first newline — exactly s.split('\n', 1)[0],
+// without building the array.
+function uptoNewline(s) {
+  const i = s.indexOf('\n');
+  return i === -1 ? s : s.slice(0, i);
+}
+
+// Index of the first non-space character of `line` after expanding tabs to
+// 4 spaces — exactly what line.replace(/\t/g, '    ').search(/[^ ]/)
+// computes, without building the expanded string. -1 when the line holds
+// no such character.
+function expandedIndent(line) {
+  let col = 0;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === ' ') col++;
+    else if (ch === '\t') col += 4;
+    else return col;
+  }
+  return -1;
+}
+
+// Exactly what !s.trim() computes: true when the string holds only
+// whitespace (the White_Space set plus line terminators), without
+// allocating the trimmed copy.
+function isBlankLine(s) {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 32 || c === 9 || c === 10 || c === 11 || c === 12 || c === 13
+      || c === 0x00a0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a)
+      || c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f
+      || c === 0x3000 || c === 0xfeff) continue;
+    return false;
+  }
+  return true;
+}
+
+// Exactly what /\n[ \t]*\n[ \t]*$/.test(raw) computes: the text ends with
+// two newlines separated (and followed) only by spaces or tabs.
+function endsWithDoubleBlank(raw) {
+  let i = raw.length;
+  while (i > 0 && (raw[i - 1] === ' ' || raw[i - 1] === '\t')) i--;
+  if (i === 0 || raw[i - 1] !== '\n') return false;
+  i--;
+  while (i > 0 && (raw[i - 1] === ' ' || raw[i - 1] === '\t')) i--;
+  if (i === 0 || raw[i - 1] !== '\n') return false;
+  return true;
+}
+
+// Exactly what /\n.*\n/.test(s) computes: `.*` cannot cross a newline, so
+// this is true iff the string holds at least two newlines.
+function hasTwoNewlines(s) {
+  const first = s.indexOf('\n');
+  return first !== -1 && s.indexOf('\n', first + 1) !== -1;
+}
+
 /* ------------------------------------------------------------------ */
 /* Link output + small tokeniser helpers                               */
 /* ------------------------------------------------------------------ */
@@ -1070,11 +1126,11 @@ class Tokenizer {
         const itemStart = taken();
         src = src.substring(cap[0].length);
 
-        const firstLine = cap[2].split('\n', 1)[0];
+        const firstLine = uptoNewline(cap[2]);
         const bulletIndent = cap[1].length;
         let line = firstLine.replace(misc.leadingSpaceTab, (whitespace) => expandTabs(whitespace, bulletIndent));
-        let nextLine = src.split('\n', 1)[0];
-        let blankLine = !line.trim();
+        let nextLine = uptoNewline(src);
+        let blankLine = isBlankLine(line);
 
         let indent = 0;
         if (blankLine) {
@@ -1101,44 +1157,42 @@ class Tokenizer {
 
           // Check if following lines should be included in List Item.
           while (src) {
-            const rawLine = src.split('\n', 1)[0];
-            let nextLineWithoutTabs;
+            const rawLine = uptoNewline(src);
             nextLine = rawLine;
 
+            // The six "end of item" tests below are all anchored to a marker
+            // character after at most `indent` spaces. Find the first
+            // non-space character (a tab breaks the run: the patterns only
+            // allow literal spaces) and run only the tests that character
+            // could pass; a letter or other ordinary character passes none.
+            // Every test just breaks, so their order does not matter.
+            let leadSpaces = 0;
+            while (leadSpaces < nextLine.length && leadSpaces <= indent && nextLine[leadSpaces] === ' ') leadSpaces++;
+            const marker = leadSpaces <= indent ? nextLine.charCodeAt(leadSpaces) : -1;
+            if (marker === 96 || marker === 126) { // ` or ~: fences
+              if (fencesBeginRegex.test(nextLine)) break;
+            } else if (marker === 35) { // #: heading
+              if (headingBeginRegex.test(nextLine)) break;
+            } else if (marker === 60) { // <: html block
+              if (htmlBeginRegex.test(nextLine)) break;
+            } else if (marker === 62) { // >: blockquote
+              if (blockquoteBeginRegex.test(nextLine)) break;
+            } else if (marker === 42 || marker === 43 || marker === 45 || (marker >= 48 && marker <= 57)) { // bullet, maybe hr
+              if (nextBulletRegex.test(nextLine)) break;
+              if ((marker === 42 || marker === 45) && hrRegex.test(nextLine)) break;
+            } else if (marker === 95) { // _: hr
+              if (hrRegex.test(nextLine)) break;
+            }
+
             // Re-align to follow commonmark nesting rules.
-            nextLineWithoutTabs = nextLine.replace(misc.leadingSpaceTab, (whitespace) => expandTabs(whitespace));
-
-            // End list item if found code fences.
-            if (fencesBeginRegex.test(nextLine)) {
-              break;
+            const nextLineWithoutTabs = nextLine.replace(misc.leadingSpaceTab, (whitespace) => expandTabs(whitespace));
+            const lineIsBlank = isBlankLine(nextLine);
+            let firstNonSpace = -1;
+            for (let k = 0; k < nextLineWithoutTabs.length; k++) {
+              if (nextLineWithoutTabs[k] !== ' ') { firstNonSpace = k; break; }
             }
 
-            // End list item if found start of new heading.
-            if (headingBeginRegex.test(nextLine)) {
-              break;
-            }
-
-            // End list item if found start of html block.
-            if (htmlBeginRegex.test(nextLine)) {
-              break;
-            }
-
-            // End list item if found start of blockquote.
-            if (blockquoteBeginRegex.test(nextLine)) {
-              break;
-            }
-
-            // End list item if found start of new bullet.
-            if (nextBulletRegex.test(nextLine)) {
-              break;
-            }
-
-            // Horizontal rule found.
-            if (hrRegex.test(nextLine)) {
-              break;
-            }
-
-            if (nextLineWithoutTabs.search(misc.nonSpaceChar) >= indent || !nextLine.trim()) { // Dedent if possible.
+            if (firstNonSpace >= indent || lineIsBlank) { // Dedent if possible.
               itemContents += '\n' + nextLineWithoutTabs.slice(indent);
             } else {
               // Not enough indentation.
@@ -1147,20 +1201,22 @@ class Tokenizer {
               }
 
               // Paragraph continuation unless last line was a different block level element.
-              if (line.replace(misc.tabCharGlobal, '    ').search(misc.nonSpaceChar) >= 4) { // Indented code block.
+              if (expandedIndent(line) >= 4) { // Indented code block.
                 break;
               }
-              if (fencesBeginRegex.test(line)) {
-                break;
-              }
-              if (headingBeginRegex.test(line)) {
-                break;
-              }
-              if (htmlBeginRegex.test(line)) {
-                break;
-              }
-              if (hrRegex.test(line)) {
-                break;
+              // Same first-character dispatch as above, on the previous line
+              // (only fences, heading, html and hr can end the item here).
+              let lineLead = 0;
+              while (lineLead < line.length && lineLead <= indent && line[lineLead] === ' ') lineLead++;
+              const lineMarker = lineLead <= indent ? line.charCodeAt(lineLead) : -1;
+              if (lineMarker === 96 || lineMarker === 126) {
+                if (fencesBeginRegex.test(line)) break;
+              } else if (lineMarker === 35) {
+                if (headingBeginRegex.test(line)) break;
+              } else if (lineMarker === 60) {
+                if (htmlBeginRegex.test(line)) break;
+              } else if (lineMarker === 42 || lineMarker === 45 || lineMarker === 95) {
+                if (hrRegex.test(line)) break;
               }
 
               // A lazy continuation can look like a setext underline after
@@ -1173,7 +1229,7 @@ class Tokenizer {
               itemContents += '\n' + continuation;
             }
 
-            blankLine = !nextLine.trim();
+            blankLine = lineIsBlank;
 
             src = src.substring(rawLine.length + 1);
             line = nextLineWithoutTabs.slice(indent);
@@ -1189,7 +1245,7 @@ class Tokenizer {
           // If the previous item ended with a blank line, the list is loose.
           if (endsWithBlankLine) {
             list.loose = true;
-          } else if (misc.doubleBlankLine.test(raw)) {
+          } else if (endsWithDoubleBlank(raw)) {
             endsWithBlankLine = true;
           }
         }
@@ -1224,7 +1280,7 @@ class Tokenizer {
         if (!list.loose) {
           // Check if list should be loose.
           const spacers = item.tokens.filter((t) => t.type === 'space');
-          const hasMultipleLineBreaks = spacers.length > 0 && spacers.some((t) => misc.anyLine.test(t.raw));
+          const hasMultipleLineBreaks = spacers.length > 0 && spacers.some((t) => hasTwoNewlines(t.raw));
 
           list.loose = hasMultipleLineBreaks;
         }
