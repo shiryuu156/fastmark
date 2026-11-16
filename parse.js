@@ -496,6 +496,10 @@ function escapeHtmlEntities(html, encode) {
 // to the character they name. Values that are zero, out of range, or a
 // surrogate become the replacement character.
 function decodeNumericCharacterReferences(text) {
+  // The pattern starts with a literal '&#', so without one there is nothing to do.
+  if (!text.includes('&#')) {
+    return text;
+  }
   if (!misc.numericCharacterReference.test(text)) {
     return text;
   }
@@ -1386,6 +1390,18 @@ class Tokenizer {
   }
 
   table(src) {
+    // The delimiter row is the second line and must hold a '-', so a second
+    // line without one (or no second line at all) cannot be a table.
+    const nl = src.indexOf('\n');
+    if (nl === -1) {
+      return;
+    }
+    const nl2 = src.indexOf('\n', nl + 1);
+    const dash = src.indexOf('-', nl + 1);
+    if (dash === -1 || (nl2 !== -1 && dash > nl2)) {
+      return;
+    }
+
     const cap = blockRules.table.exec(src);
     if (!cap) {
       return;
@@ -1449,6 +1465,49 @@ class Tokenizer {
   }
 
   lheading(src) {
+    // The setext underline must sit on a line before the first blank line
+    // (content cannot cross one). Scan those lines for one that could be an
+    // underline — up to three leading spaces, then = or - — and bail out
+    // when none can; the regex still decides every candidate, including
+    // lines an interrupting block would rule out.
+    let pos = src.indexOf('\n');
+    if (pos === -1) {
+      return;
+    }
+    let candidate = false;
+    while (pos !== -1) {
+      const start = pos + 1;
+      const end = src.indexOf('\n', start);
+      const lineEnd = end === -1 ? src.length : end;
+      let i = start;
+      let spaces = 0;
+      while (i < lineEnd && src[i] === ' ') {
+        i++;
+        spaces++;
+      }
+      if (i === lineEnd) {
+        return; // Blank line (spaces only): content cannot cross it.
+      }
+      let onlyTabs = true;
+      for (let j = i; j < lineEnd; j++) {
+        if (src[j] !== '\t') {
+          onlyTabs = false;
+          break;
+        }
+      }
+      if (onlyTabs) {
+        return; // Blank line (spaces then tabs): content cannot cross it.
+      }
+      if (spaces <= 3 && (src[i] === '=' || src[i] === '-')) {
+        candidate = true;
+        break;
+      }
+      pos = end;
+    }
+    if (!candidate) {
+      return;
+    }
+
     const cap = blockRules.lheading.exec(src);
     if (cap) {
       const text = cap[1].trim();
@@ -1934,6 +1993,9 @@ class Lexer {
   constructor() {
     this.tokens = [];
     this.tokens.links = Object.create(null);
+    // True once at least one link reference definition has been stored;
+    // maskSrc only needs its reflink pass when one exists.
+    this.hasLinks = false;
     this.tokenizer = new Tokenizer();
     this.tokenizer.lexer = this;
     this.inlineQueue = [];
@@ -1949,7 +2011,9 @@ class Lexer {
   // Preprocessing: normalise line endings, lex blocks, then drain the
   // queued inline passes in order.
   lex(src) {
-    src = src.replace(misc.carriageReturn, '\n');
+    if (src.includes('\r')) {
+      src = src.replace(misc.carriageReturn, '\n');
+    }
 
     this.blockTokens(src, this.tokens);
 
@@ -2073,6 +2137,7 @@ class Lexer {
               href: token.href,
               title: token.title,
             };
+            this.hasLinks = true;
           }
           tokens.push(token);
         }
@@ -2191,10 +2256,15 @@ class Lexer {
 
   inlineTokensInner(src, tokens) {
     // The masked source is only read by emStrong and del, which need a *, _ or
-    // ~ to start. Skip building it for a run without one.
-    const maskedSrc = src.includes('*') || src.includes('_') || src.includes('~')
-      ? this.maskSrc(src)
-      : src;
+    // ~ to start. Skip building it for a run without one — and skip the closer
+    // scan too, since neither emStrong nor del can run there either (the
+    // dispatch only calls them at those characters, and nested runs hold
+    // substrings of the outer run, so they cannot gain one).
+    const hasDelims = src.includes('*') || src.includes('_') || src.includes('~');
+    const maskedSrc = hasDelims ? this.maskSrc(src) : src;
+    if (!hasDelims) {
+      return this.tokenizeInlines(src, maskedSrc, tokens);
+    }
 
     // One scan of this maskedSrc for the last emphasis, strong, and
     // strikethrough closers, shared by every opener in the pass. Popped
@@ -2341,8 +2411,9 @@ class Lexer {
     // String with links masked to avoid interference with em and strong.
     let maskedSrc = src;
 
-    // Mask out reflinks.
-    if (this.tokens.links && src.includes('[')) {
+    // Mask out reflinks. Without a stored definition no candidate can match,
+    // so the whole pass is skipped.
+    if (this.hasLinks && src.includes('[')) {
       const reflinkSearch = inlineRules.reflinkSearch;
       const maskReflink = (match0) => {
         const refStart = match0.lastIndexOf('[');
