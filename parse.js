@@ -2574,10 +2574,13 @@ class Lexer {
   maskSrc(src) {
     // String with links masked to avoid interference with em and strong.
     let maskedSrc = src;
+    // No pass below adds or removes a '[', so one check serves both the
+    // reflink pass and the blockSkip pass.
+    const hasBracket = src.includes('[');
 
     // Mask out reflinks. Without a stored definition no candidate can match,
     // and without a ']' no label can close, so the whole pass is skipped.
-    if (this.hasLinks && src.includes('[') && src.includes(']')) {
+    if (this.hasLinks && hasBracket && src.includes(']')) {
       const reflinkSearch = inlineRules.reflinkSearch;
       const maskReflink = (match0) => {
         const refStart = match0.lastIndexOf('[');
@@ -2626,7 +2629,7 @@ class Lexer {
 
     // Mask out other blocks. blockSkip can only match a link (needs `[`),
     // a code span (needs a backtick) or html (needs `<`).
-    if (maskedSrc.includes('[') || maskedSrc.includes('`') || maskedSrc.includes('<')) {
+    if (hasBracket || maskedSrc.includes('`') || maskedSrc.includes('<')) {
       maskedSrc = maskedSrc.replace(inlineRules.blockSkip, (match0, _link, context) => {
         const offset = context ? context.length : 0;
         return match0.slice(0, offset) + '[' + 'a'.repeat(match0.length - offset - 2) + ']';
@@ -2654,7 +2657,10 @@ class Renderer {
     const langString = (lang || '').match(misc.notSpaceStart)?.[0];
 
     // An empty code block has no content, so it must not gain a newline.
-    const code = text ? text.replace(misc.endingNewline, '') + '\n' : '';
+    // Otherwise the block ends with exactly one newline: strip a trailing
+    // one and add it back, which is the text itself when one is already
+    // there.
+    const code = text ? (text.endsWith('\n') ? text : text + '\n') : '';
 
     if (!langString) {
       return '<pre><code>'
