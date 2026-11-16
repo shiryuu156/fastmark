@@ -1,5 +1,11 @@
 // fastmark driver for the make.fun markdown-render-speed-02 harness.
 //
+// Competition driver: the harness runs this file, and it renders every
+// case with parse() from parse.js — one case at a time, no shared state —
+// then writes the HTML strings out as a JSON array, one per case, in
+// the cases' order. This is the submitted entry point; the rendering
+// itself lives entirely in parse.js.
+//
 // The harness runs `node /bot/main.ts` (Node 22, types stripped natively).
 // This program reads every case from the input directory, renders each one
 // alone with parse() from parse.js, and writes the HTML strings — one per

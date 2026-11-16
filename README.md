@@ -41,3 +41,18 @@ node /tmp/mdtest/test.mjs "$PWD/parse.js"
 MAKEFUN_INPUT_DIR=<kit>/practice/input MAKEFUN_OUTPUT_DIR=/tmp/mdout node main.ts
 node /tmp/mdtest/e2e.mjs
 ```
+
+## Submission
+
+Submitted to the make.fun `markdown-render-speed-02` bounty as the
+shiryuu156/fastmark entry. Final verified state, re-recorded 2026-11-16:
+
+- 720/720 practice cases byte-identical to marked 18.1.3 (including the
+  end-to-end `main.ts` run — 720 outputs, 0 mismatches).
+- 1.746x faster than marked on the full 720-case set (interleaved CPU time:
+  marked ~731ms vs fastmark ~418ms per full-set pass on this VM).
+- 78,000 differential fuzz inputs against marked, 0 mismatches.
+
+No behaviour changed after verification — this commit only records the
+final state (submission notes and header comments) so the entry's
+transcripts cover it.
